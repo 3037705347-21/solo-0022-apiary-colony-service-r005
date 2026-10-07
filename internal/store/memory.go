@@ -112,9 +112,16 @@ func (m *Memory) AddInspection(hiveID string, inspection domain.Inspection) (dom
 	return inspection, nil
 }
 
-// AppendQueen 追加一条产卵蜂王记录，并把蜂箱的当前蜂王指针指向它。
-// 旧蜂王记录的关闭由调用方在之后通过 CloseQueen 单独完成。
-func (m *Memory) AppendQueen(hiveID string, queen domain.Queen) (domain.Queen, error) {
+// ReplaceQueen 在一次换王中关闭蜂箱当前产卵的蜂王记录、追加新的产卵记录，
+// 并把蜂箱的当前蜂王指针指向新记录。整个读取-修改-写入处于同一把写锁，
+// 保证任意时刻同一蜂箱最多只有一只产卵蜂王，蜂箱指针始终指向它，
+// 并发换王与并发读取都不会观察到中间状态。已关闭的记录不再改动。
+func (m *Memory) ReplaceQueen(
+	hiveID string,
+	queen domain.Queen,
+	closeState domain.QueenState,
+	closedAt time.Time,
+) (domain.Queen, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	hive, ok := m.hives[hiveID]
@@ -124,60 +131,26 @@ func (m *Memory) AppendQueen(hiveID string, queen domain.Queen) (domain.Queen, e
 	if !hive.AcceptsQueenChange() {
 		return domain.Queen{}, domain.InvalidState("蜂箱 %q 处于 %q 状态，不接受换王", hiveID, hive.State)
 	}
+	items := m.queens[hiveID]
+	for index, item := range items {
+		if !item.IsLaying() {
+			continue
+		}
+		closed := closedAt.UTC()
+		item.State = closeState
+		item.ClosedAt = &closed
+		items[index] = item
+	}
 	m.queenSeq++
 	queen.ID = fmt.Sprintf("queen-%06d", m.queenSeq)
 	queen.HiveID = hiveID
 	queen.State = domain.QueenLaying
 	queen.ClosedAt = nil
-	m.queens[hiveID] = append(m.queens[hiveID], queen)
+	m.queens[hiveID] = append(items, queen)
 
 	hive.ActiveQueenID = queen.ID
 	m.hives[hiveID] = hive
 	return queen, nil
-}
-
-// CloseQueen 关闭蜂箱上指定的蜂王记录，写入关闭状态与关闭时间。
-// 调用方负责给出需要被本次接替替代的那只蜂王。
-func (m *Memory) CloseQueen(
-	hiveID string,
-	queenID string,
-	state domain.QueenState,
-	now time.Time,
-) error {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	items := m.queens[hiveID]
-	for index, item := range items {
-		if item.ID != queenID {
-			continue
-		}
-		if !item.IsLaying() {
-			return domain.Conflict("蜂王 %q 已经关闭", queenID)
-		}
-		closedAt := now.UTC()
-		item.State = state
-		item.ClosedAt = &closedAt
-		items[index] = item
-		m.queens[hiveID] = items
-		return nil
-	}
-	return domain.Storage("蜂箱 %q 上的蜂王 %q 记录缺失", hiveID, queenID)
-}
-
-// CurrentQueen 返回蜂箱当前指针指向的那条蜂王记录，读到的是调用时刻的状态。
-func (m *Memory) CurrentQueen(hiveID string) (domain.Queen, bool) {
-	m.mu.RLock()
-	defer m.mu.RUnlock()
-	hive, ok := m.hives[hiveID]
-	if !ok || hive.ActiveQueenID == "" {
-		return domain.Queen{}, false
-	}
-	for _, item := range m.queens[hiveID] {
-		if item.ID == hive.ActiveQueenID {
-			return item, true
-		}
-	}
-	return domain.Queen{}, false
 }
 
 func (m *Memory) ListInspections(hiveID string) ([]domain.Inspection, error) {
