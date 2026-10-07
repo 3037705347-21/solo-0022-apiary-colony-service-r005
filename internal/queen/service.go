@@ -13,7 +13,7 @@ const (
 	ReasonLoss       = "loss"
 )
 
-// Service 处理换王：关闭旧蜂王记录并写入带标记色的新记录。
+// Service 处理换王：旧蜂王关闭与新蜂王写入在仓储的一次原子操作中完成。
 type Service struct {
 	store *store.Memory
 	clock func() time.Time
@@ -32,42 +32,19 @@ type ReplaceInput struct {
 	Reason       string
 }
 
-// succession 描述一次换王要关闭的旧蜂王与关闭方式。它在追加新记录之前
-// 由当时读到的蜂箱快照推导，随后才交给仓储分别执行。
-type succession struct {
-	previousID string
-	closeState domain.QueenState
-	closedAt   time.Time
-}
-
-func planSuccession(
-	hive domain.Hive,
-	current domain.Queen,
-	hasCurrent bool,
-	reason string,
-	at time.Time,
-) succession {
-	closeState := domain.QueenSuperseded
+// closeStateFor 把换王原因映射为旧蜂王的关闭状态：失王登记记为 lost，
+// 其余原因记为 superseded。
+func closeStateFor(reason string) domain.QueenState {
 	if reason == ReasonLoss {
-		closeState = domain.QueenLost
+		return domain.QueenLost
 	}
-	previousID := hive.ActiveQueenID
-	if hasCurrent {
-		previousID = current.ID
-	}
-	return succession{
-		previousID: previousID,
-		closeState: closeState,
-		closedAt:   at.UTC(),
-	}
+	return domain.QueenSuperseded
 }
 
 func (s *Service) Replace(hiveID string, input ReplaceInput) (domain.Queen, error) {
-	hive, ok := s.store.GetHive(hiveID)
-	if !ok {
+	if _, ok := s.store.GetHive(hiveID); !ok {
 		return domain.Queen{}, domain.NotFound("蜂箱", hiveID)
 	}
-	current, hasCurrent := s.store.CurrentQueen(hiveID)
 	origin, err := ParseOrigin(input.Origin)
 	if err != nil {
 		return domain.Queen{}, err
@@ -84,17 +61,7 @@ func (s *Service) Replace(hiveID string, input ReplaceInput) (domain.Queen, erro
 	if err != nil {
 		return domain.Queen{}, err
 	}
-	plan := planSuccession(hive, current, hasCurrent, reason, s.clock())
-	saved, err := s.store.AppendQueen(hiveID, record)
-	if err != nil {
-		return domain.Queen{}, err
-	}
-	if plan.previousID != "" {
-		if err := s.store.CloseQueen(hiveID, plan.previousID, plan.closeState, plan.closedAt); err != nil {
-			return domain.Queen{}, err
-		}
-	}
-	return saved, nil
+	return s.store.ReplaceQueen(hiveID, record, closeStateFor(reason), s.clock())
 }
 
 func (s *Service) List(hiveID string) ([]domain.Queen, error) {
